@@ -45,7 +45,7 @@ jobs:
       empty: ${{ steps.matrix.outputs.empty }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build matrix from versions.json
         id: matrix
@@ -97,7 +97,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Free up disk space
         # Flutter images are large; the default runner does not have
