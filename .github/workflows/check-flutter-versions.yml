@@ -1,0 +1,76 @@
+name: Check Flutter versions
+
+# Polls the upstream Flutter release index, updates versions.json when a
+# new stable or beta build appears, commits the change directly to the
+# default branch, and kicks off the build workflow. Designed to run
+# unattended on a schedule.
+
+on:
+  schedule:
+    # Every 2 hours, on the hour.
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: check-flutter-versions
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          if ! command -v jq >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      - name: Update versions.json
+        run: bash scripts/update_flutter_versions.sh
+
+      - name: Show diff
+        run: git --no-pager diff -- versions.json || true
+
+      - name: Commit and push if changed
+        id: commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet -- versions.json; then
+            echo "No Flutter version changes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Build a human-readable summary from the new versions.json so the
+          # commit message captures which channels moved.
+          summary=$(jq -r '
+            .images
+            | map("\(.tags | join("/")): \(.flutter_version)")
+            | join(", ")
+          ' versions.json)
+
+          git add versions.json
+          git commit -m "chore: update Flutter versions ($summary)"
+          git push origin HEAD:${GITHUB_REF#refs/heads/}
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger build workflow
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Pushes made with GITHUB_TOKEN do not trigger downstream workflows,
+        # so we explicitly dispatch the build after committing.
+        run: gh workflow run build-and-push.yml --ref "${GITHUB_REF#refs/heads/}"
