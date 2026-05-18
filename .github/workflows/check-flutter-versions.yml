@@ -7,8 +7,8 @@ name: Check Flutter versions
 
 on:
   schedule:
-    # Every 2 hours, on the hour.
-    - cron: "0 */2 * * *"
+    # Every hour, on the hour.
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
