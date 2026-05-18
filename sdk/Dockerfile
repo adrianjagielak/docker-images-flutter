@@ -1,6 +1,9 @@
 FROM ghcr.io/cirruslabs/android-sdk:36
 
-LABEL org.opencontainers.image.source=https://github.com/cirruslabs/docker-images-flutter
+LABEL org.opencontainers.image.source=https://github.com/adrianjagielak/docker-images-flutter
+LABEL org.opencontainers.image.description="Flutter SDK on top of the Android SDK. Continued fork of cirruslabs/docker-images-flutter."
+LABEL org.opencontainers.image.licenses=MIT
+
 USER root
 
 ARG flutter_version
@@ -9,7 +12,7 @@ ENV FLUTTER_HOME=${HOME}/sdks/flutter \
     FLUTTER_VERSION=$flutter_version
 ENV FLUTTER_ROOT=$FLUTTER_HOME
 
-ENV PATH ${PATH}:${FLUTTER_HOME}/bin:${FLUTTER_HOME}/bin/cache/dart-sdk/bin
+ENV PATH=${PATH}:${FLUTTER_HOME}/bin:${FLUTTER_HOME}/bin/cache/dart-sdk/bin
 
 RUN git clone --depth 1 --branch ${FLUTTER_VERSION} https://github.com/flutter/flutter.git ${FLUTTER_HOME}
 

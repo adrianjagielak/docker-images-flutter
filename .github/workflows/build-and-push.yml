@@ -1,0 +1,170 @@
+name: Build and push Docker images
+
+# Reads the Flutter versions declared in versions.json, builds a
+# multi-arch (amd64 + arm64) image for each unique Flutter version, and
+# pushes it to GitHub Container Registry tagged with every channel tag
+# that points at it (latest, stable, beta, ...) as well as the literal
+# Flutter version. Runs whenever the inputs change, on a weekly cadence
+# to pick up base-image security updates, and on demand.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "versions.json"
+      - "sdk/**"
+      - ".github/workflows/build-and-push.yml"
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: "Restrict the build to a single Flutter version (optional, must match an entry in versions.json)."
+        required: false
+        type: string
+  # Weekly rebuild to pull fresh base layers and OS patches even when the
+  # Flutter version itself has not moved.
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/flutter
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      empty: ${{ steps.matrix.outputs.empty }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build matrix from versions.json
+        id: matrix
+        env:
+          FILTER_VERSION: ${{ inputs.flutter_version }}
+        run: |
+          # Group entries that share a flutter_version so we build the
+          # image once and push it under every channel tag at the same
+          # time.
+          matrix=$(jq -c '
+            [
+              .images
+              | group_by(.flutter_version)
+              | .[]
+              | {
+                  flutter_version: .[0].flutter_version,
+                  tags: ([.[].tags[]] | unique)
+                }
+            ]
+            | { include: . }
+          ' versions.json)
+
+          if [ -n "${FILTER_VERSION:-}" ]; then
+            matrix=$(jq -c --arg v "$FILTER_VERSION" '
+              { include: [ .include[] | select(.flutter_version == $v) ] }
+            ' <<<"$matrix")
+          fi
+
+          include_count=$(jq '.include | length' <<<"$matrix")
+          echo "Matrix ($include_count entries):"
+          jq . <<<"$matrix"
+
+          {
+            echo "matrix=$matrix"
+            if [ "$include_count" -eq 0 ]; then
+              echo "empty=true"
+            else
+              echo "empty=false"
+            fi
+          } >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.empty == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        # Flutter images are large; the default runner does not have
+        # enough headroom for a multi-arch buildx run with caching.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        env:
+          FLUTTER_VERSION: ${{ matrix.flutter_version }}
+          CHANNEL_TAGS: ${{ toJson(matrix.tags) }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          # Image tags must not contain '+'. Flutter uses '+' for build
+          # metadata in some pre-releases; replace with '-' as the old
+          # ci.sh did.
+          version_tag="${FLUTTER_VERSION//+/-}"
+
+          tag_lines="${IMAGE}:${version_tag}"
+          while read -r t; do
+            tag_lines+=$'\n'"${IMAGE}:${t}"
+          done < <(jq -r '.[]' <<<"$CHANNEL_TAGS")
+
+          {
+            echo "tags<<__EOF__"
+            echo "$tag_lines"
+            echo "__EOF__"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Will tag image as:"
+          echo "$tag_lines"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: sdk
+          file: sdk/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            flutter_version=${{ matrix.flutter_version }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # Per-version cache scope so the cache for one Flutter version
+          # is not invalidated when another moves.
+          cache-from: type=gha,scope=flutter-${{ matrix.flutter_version }}
+          cache-to: type=gha,mode=max,scope=flutter-${{ matrix.flutter_version }}
