@@ -66,11 +66,38 @@ jobs:
           git push origin HEAD:${GITHUB_REF#refs/heads/}
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Trigger build workflow
         if: steps.commit.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ steps.commit.outputs.sha }}
         # Pushes made with GITHUB_TOKEN do not trigger downstream workflows,
         # so we explicitly dispatch the build after committing.
-        run: gh workflow run build-and-push.yml --ref "${GITHUB_REF#refs/heads/}"
+        #
+        # workflow_dispatch resolves --ref to the branch tip *at dispatch
+        # time*, and a freshly pushed commit can take a few seconds to become
+        # visible to that resolver. Dispatching immediately therefore races
+        # the push: if the old tip is resolved, the build checks out the
+        # previous commit and rebuilds the previous Flutter version. (This is
+        # exactly how 3.44.3 was committed but never built -- the dispatch
+        # resolved to the prior 3.44.2 commit and rebuilt it under the
+        # latest/stable tags.) Wait until the API reports our pushed commit as
+        # the branch tip before dispatching, and fail loudly rather than
+        # dispatch a stale build if it never shows up.
+        run: |
+          for attempt in $(seq 1 30); do
+            remote_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BRANCH}" --jq '.sha')
+            echo "Attempt ${attempt}: branch tip=${remote_sha} expected=${EXPECTED_SHA}"
+            if [ "$remote_sha" = "$EXPECTED_SHA" ]; then
+              echo "Pushed commit is visible to the API; dispatching build."
+              gh workflow run build-and-push.yml --ref "$BRANCH"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::error::Pushed commit ${EXPECTED_SHA} never became the tip of ${BRANCH}; refusing to dispatch a stale build."
+          exit 1
