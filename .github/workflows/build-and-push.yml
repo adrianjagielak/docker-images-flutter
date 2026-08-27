@@ -101,11 +101,13 @@ jobs:
 
       - name: Free up disk space
         # Flutter images are large; the default runner does not have
-        # enough headroom for a multi-arch buildx run with caching.
+        # enough headroom for a multi-arch buildx run with caching. The
+        # image builds its own Android SDK, so the runner's preinstalled
+        # copy is dead weight and gets reclaimed too.
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
-          android: false
+          android: true
           dotnet: true
           haskell: true
           large-packages: true
@@ -158,13 +160,19 @@ jobs:
         with:
           context: sdk
           file: sdk/Dockerfile
+          target: flutter
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
           build-args: |
             flutter_version=${{ matrix.flutter_version }}
           tags: ${{ steps.tags.outputs.tags }}
-          # Per-version cache scope so the cache for one Flutter version
-          # is not invalidated when another moves.
-          cache-from: type=gha,scope=flutter-${{ matrix.flutter_version }}
-          cache-to: type=gha,mode=max,scope=flutter-${{ matrix.flutter_version }}
+          # One shared cache scope rather than one per Flutter version. The
+          # image now builds the Android SDK itself instead of inheriting it
+          # from a prebuilt base, and those layers are identical for every
+          # Flutter version -- a per-version scope would rebuild the whole
+          # Android half (under QEMU, for arm64) every time a channel moves.
+          # A shared scope keeps that prefix warm; the Flutter-specific layers
+          # miss for a new version either way.
+          cache-from: type=gha,scope=flutter
+          cache-to: type=gha,mode=max,scope=flutter
