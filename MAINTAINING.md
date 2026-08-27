@@ -28,22 +28,9 @@ Runs every five minutes (and on demand). Each run:
 3. If — and only if — they differ, checks the repository out, rewrites `versions.json` via `scripts/update_flutter_versions.sh`, and re-checks the working tree before committing.
 4. Commits the file directly to the default branch and dispatches the build workflow. The commit summary lists every channel/version pair (`chore: update Flutter versions (latest/stable: 3.x.y, beta: 3.x.y-N.N.pre)`).
 
-Almost every run stops at step 2, so that path is kept to two small JSON fetches: nothing is checked out and git is never invoked unless a version actually moved. The step-4 re-check exists because the step-1 read can race a bump that lands between the probe and the commit; the working tree, not the probe, is what gates the commit.
+Almost every run stops at step 2, so that path is kept to two small JSON fetches: nothing is checked out and git is never invoked unless a version actually moved. The step-3 re-check exists because the step-1 read can race a bump that lands between the probe and the commit; the working tree, not the probe, is what gates the commit.
 
-#### Detection latency, and why five minutes
-
-**Five minutes is GitHub's floor for `schedule`** — [the shortest supported interval](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule), and a faster cron is silently coerced up to it. The schedule is set to `1/5 * * * *` (`:01`, `:06`, `:11`, …) rather than `*/5` because scheduled runs are best-effort and are queued behind the global spike at popular slots — the top of the hour worst of all — so unpopular minutes are dispatched sooner. Expect the real cadence to be somewhat looser than five minutes; GitHub makes no promise about scheduled start times, and delays of tens of minutes happen under load.
-
-Standard runners are free on public repositories, so the cost of the schedule is runner slots rather than money.
-
-To react **faster than five minutes**, a run has to stay alive and keep polling, because no cron can fire more often. Two optional repository variables (*Settings → Secrets and variables → Actions → Variables*) turn that on:
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `FLUTTER_WATCH_SECONDS` | `0` | How long a single run keeps polling before exiting. `0` probes once. Clamped to 3000. |
-| `FLUTTER_POLL_SECONDS` | `30` | Delay between polls within that window. Clamped to a minimum of 10. |
-
-Setting `FLUTTER_WATCH_SECONDS=290` gives near-continuous coverage: each run polls for just under five minutes, and the next scheduled run picks up where it left off. Detection latency then drops to roughly `FLUTTER_POLL_SECONDS`. The trade is that a runner is occupied essentially around the clock instead of for a few seconds every five minutes, to shave minutes off a feed that moves every week or two. Leave the variables unset unless that trade is clearly worth it. The `concurrency` group means overlapping runs queue rather than pile up, and the job's `timeout-minutes` bounds a wedged run either way.
+Five minutes is GitHub's floor for `schedule` — [the shortest supported interval](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule), and a faster cron is silently coerced up to it. The schedule is `1/5 * * * *` (`:01`, `:06`, `:11`, …) rather than `*/5` because scheduled runs are best-effort and are queued behind the global spike at popular slots — the top of the hour worst of all — so unpopular minutes are dispatched sooner. Expect the real cadence to be looser than five minutes regardless; GitHub makes no promise about scheduled start times, and delays of tens of minutes happen under load. Standard runners are free on public repositories, so the cost of the schedule is runner slots rather than money.
 
 Because pushes made by `GITHUB_TOKEN` do not trigger downstream workflows, the build is started with an explicit `gh workflow run` call from the same job. A direct push (not via `GITHUB_TOKEN`) to `master` will trigger the build via the normal `push` event instead.
 
