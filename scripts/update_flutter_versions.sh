@@ -10,7 +10,9 @@ set -euo pipefail
 VERSIONS_FILE="${VERSIONS_FILE:-versions.json}"
 RELEASES_URL="https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json"
 
-releases_json=$(curl -fsSL "$RELEASES_URL")
+# Retry transient blips: a failure here costs the bump a whole poll cycle.
+releases_json=$(curl -fsSL --max-time 30 \
+    --retry 3 --retry-delay 2 --retry-all-errors "$RELEASES_URL")
 
 get_latest_version_in_channel() {
     local channel=$1

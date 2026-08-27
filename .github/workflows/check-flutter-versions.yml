@@ -4,11 +4,24 @@ name: Check Flutter versions
 # new stable or beta build appears, commits the change directly to the
 # default branch, and kicks off the build workflow. Designed to run
 # unattended on a schedule.
+#
+# Upstream has not moved on the overwhelming majority of runs, so that
+# path is deliberately cheap: two small JSON fetches and nothing else.
+# The repository is only checked out, and git only touched, once a
+# version has actually changed.
 
 on:
   schedule:
-    # Every hour, on the hour.
-    - cron: "0 * * * *"
+    # Every five minutes -- the shortest interval GitHub supports for
+    # `schedule`. Anything faster is coerced up to it, so this is the
+    # floor for a plain cron trigger.
+    #
+    # "1/5" means "every 5 minutes starting at minute 1", i.e. :01, :06,
+    # :11, ... rather than the usual :00, :05, :10. Scheduled runs are
+    # best effort and get queued behind the global spike at popular
+    # slots -- the top of the hour worst of all -- so sitting on
+    # unpopular minutes measurably cuts the queueing delay.
+    - cron: "1/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -22,30 +35,107 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A plain probe finishes in seconds. This cap only exists so a wedged
+    # run cannot sit on the concurrency group indefinitely; it has to
+    # clear the optional watch window plus the post-push dispatch wait.
+    timeout-minutes: 60
+    env:
+      RELEASES_URL: https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json
+      # Optional repository variables (Settings -> Secrets and variables
+      # -> Actions -> Variables) that buy lower detection latency with
+      # runner time. Unset means "probe once and exit", so detection
+      # latency is whatever the schedule above delivers. Setting
+      # FLUTTER_WATCH_SECONDS keeps a single run polling for that long,
+      # which is the only way to react faster than five minutes -- at the
+      # cost of occupying a runner for the whole window. See
+      # MAINTAINING.md.
+      WATCH_SECONDS: ${{ vars.FLUTTER_WATCH_SECONDS || '0' }}
+      POLL_SECONDS: ${{ vars.FLUTTER_POLL_SECONDS || '30' }}
     steps:
+      - name: Probe for a new Flutter release
+        id: probe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Repository variables are free-form strings; fall back to the
+          # defaults rather than letting a typo break the arithmetic.
+          watch=$WATCH_SECONDS
+          poll=$POLL_SECONDS
+          case "$watch" in ''|*[!0-9]*) watch=0 ;; esac
+          case "$poll"  in ''|*[!0-9]*) poll=30 ;; esac
+          # Keep a mistyped variable from pinning a runner for hours, and
+          # keep the poll rate clear of upstream's rate limits.
+          if [ "$watch" -gt 3000 ]; then watch=3000; fi
+          if [ "$poll" -lt 10 ]; then poll=10; fi
+
+          # versions.json as it currently stands on the branch, read over
+          # the API rather than via actions/checkout so that a run which
+          # finds nothing does no git work at all.
+          current=$(gh api \
+            -H "Accept: application/vnd.github.raw" \
+            "repos/${GITHUB_REPOSITORY}/contents/versions.json?ref=${BRANCH}")
+
+          have_stable=$(jq -r 'first(.images[] | select(.tags | index("stable")) | .flutter_version) // ""' <<<"$current")
+          have_beta=$(jq -r 'first(.images[] | select(.tags | index("beta")) | .flutter_version) // ""' <<<"$current")
+          echo "versions.json: stable=$have_stable beta=$have_beta"
+
+          deadline=$((SECONDS + watch))
+          while :; do
+            # Retry transient blips rather than failing the run: at twelve
+            # runs an hour a bare -f turns every upstream hiccup into a red
+            # X. A hard failure here therefore means the feed is really down.
+            releases=$(curl -fsSL --max-time 30 \
+              --retry 3 --retry-delay 2 --retry-all-errors "$RELEASES_URL")
+
+            want_stable=$(jq -r '.current_release.stable as $h | first(.releases[] | select(.hash == $h) | .version) // ""' <<<"$releases")
+            want_beta=$(jq -r '.current_release.beta as $h | first(.releases[] | select(.hash == $h) | .version) // ""' <<<"$releases")
+
+            if [ -z "$want_stable" ] || [ -z "$want_beta" ]; then
+              # A truncated or partially published index must never read
+              # as "the channel moved" -- that would commit a bad bump
+              # and rebuild the images under it.
+              echo "::warning::Release index did not resolve both channels; ignoring this poll."
+            elif [ "$want_stable" != "$have_stable" ] || [ "$want_beta" != "$have_beta" ]; then
+              echo "Upstream moved: stable=$want_stable beta=$want_beta"
+              echo "changed=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Stop rather than sleep past the end of the watch window.
+            # With watch=0 this breaks after the first poll.
+            if [ "$SECONDS" -ge "$((deadline - poll))" ]; then
+              break
+            fi
+            sleep "$poll"
+          done
+
+          echo "No Flutter version changes."
+          echo "changed=false" >>"$GITHUB_OUTPUT"
+
       - name: Checkout
+        if: steps.probe.outputs.changed == 'true'
         uses: actions/checkout@v6
 
-      - name: Install jq
-        run: |
-          if ! command -v jq >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y jq
-          fi
-
       - name: Update versions.json
+        if: steps.probe.outputs.changed == 'true'
         run: bash scripts/update_flutter_versions.sh
 
-      - name: Show diff
-        run: git --no-pager diff -- versions.json || true
-
-      - name: Commit and push if changed
+      - name: Commit and push
         id: commit
+        if: steps.probe.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          git --no-pager diff -- versions.json || true
+
+          # The probe reads the branch over the API and can race a bump
+          # that lands between that read and this step, so the working
+          # tree -- not the probe -- is what actually gates the commit.
           if git diff --quiet -- versions.json; then
-            echo "No Flutter version changes."
+            echo "versions.json is already up to date."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
