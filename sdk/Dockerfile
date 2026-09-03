@@ -6,6 +6,13 @@ LABEL org.opencontainers.image.licenses=MIT
 
 USER root
 
+# The flutter wrapper prints a superuser warning for a root shell. The wrapper
+# stays quiet for Docker, for CI, and for a bot. Docker creates /.dockerenv, but
+# containerd, Podman and a microVM sandbox do not. The image therefore creates
+# the marker file and sets the bot flag.
+ENV BOT=true
+RUN touch /.dockerenv
+
 ARG flutter_version
 
 ENV FLUTTER_HOME=${HOME}/sdks/flutter \
