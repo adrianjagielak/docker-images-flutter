@@ -17,7 +17,7 @@ If you forked from `adrianjagielak/docker-images-flutter`, also update the image
 
 ## How the automation works
 
-Two workflows keep this repository running without manual intervention.
+Two workflows keep this repository running without manual intervention, and a third gates changes to the image before they merge.
 
 ### `.github/workflows/check-flutter-versions.yml`
 
@@ -44,6 +44,15 @@ For each unique Flutter version in `versions.json` it builds a single multi-arch
 All matrix entries share one `type=gha` cache scope. Since the image builds the Android SDK itself rather than inheriting it from a prebuilt base, the Android layers are byte-identical across Flutter versions, and a shared scope lets a build of a brand-new Flutter version start from them instead of rebuilding the Android half from scratch. The Flutter-specific layers are a cache miss for a new version either way, so nothing is lost by not scoping per version — and one scope rather than N keeps the repository under the 10 GB GitHub Actions cache limit.
 
 `arm64` is built via QEMU emulation on the same `ubuntu-latest` runner as `amd64`. This matches the original Cirrus setup, but note that emulated arm64 now covers the Android SDK install (`apt`, and several JVM `sdkmanager` runs) as well as the Flutter steps, so a cold cache is considerably slower than it used to be. If `arm64` build time becomes painful, the matrix can be split across `ubuntu-latest` + `ubuntu-24.04-arm` so each architecture builds natively, with a separate `docker buildx imagetools create` job to merge the manifest.
+
+### `.github/workflows/pr-build.yml`
+
+Pre-merge validation. The release workflow above only runs on pushes to the default branch, so without this a structural change to the image would first be exercised *after* it had been merged.
+
+On a pull request touching `sdk/**` or either build workflow, it builds the current `stable` entry from `versions.json` for both published architectures with `push: false` — no registry credentials, no tags, result discarded. Version bumps to `versions.json` deliberately do not trigger it: those change nothing that can break the build, and they land on `master` directly rather than through a PR anyway.
+
+It reads the release build's `type=gha` cache scope so the Android layers start warm, but never writes to it — a pull request must not be able to influence what the release build reuses. Runs are capped at 240 minutes and superseded by the next push to the same PR.
+
 
 ## Local development
 
@@ -106,7 +115,7 @@ The Android SDK image downloaded this helper from `travis-ci/travis-cookbooks@ma
 
 ### Third-party GitHub Actions
 
-`build-and-push.yml` uses `jlumbroso/free-disk-space@main` (unpinned). If you prefer supply-chain pinning, replace `@main` with a commit SHA. The other actions (`docker/setup-qemu-action`, `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action`, `actions/checkout`) are pinned to major versions.
+`build-and-push.yml` and `pr-build.yml` use `jlumbroso/free-disk-space@main` (unpinned). If you prefer supply-chain pinning, replace `@main` with a commit SHA. The other actions (`docker/setup-qemu-action`, `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action`, `actions/checkout`) are pinned to major versions.
 
 ## Maintenance checklist
 

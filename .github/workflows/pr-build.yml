@@ -1,0 +1,90 @@
+name: PR build check
+
+# Pre-merge validation for changes to the image itself. The release
+# workflow only runs on pushes to the default branch, so without this a
+# structural change to sdk/Dockerfile would first be exercised after it
+# had already been merged.
+#
+# Builds the current stable Flutter entry for both published
+# architectures and throws the result away -- nothing is pushed and no
+# registry credentials are needed. Version bumps to versions.json do not
+# trigger it; only changes that can actually break the build do.
+
+on:
+  pull_request:
+    paths:
+      - "sdk/**"
+      - ".github/workflows/pr-build.yml"
+      - ".github/workflows/build-and-push.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the same PR supersedes this run.
+  group: pr-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # arm64 goes through QEMU, so a cold cache is slow. Bound it well
+    # short of the 6h default so a runaway build fails loudly instead.
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Pick the Flutter version to build
+        id: version
+        run: |
+          # Build whatever versions.json currently calls stable; one
+          # version is enough to prove the Dockerfile works.
+          version=$(jq -r '
+            (.images[] | select(.tags | index("stable")) | .flutter_version)
+            // .images[0].flutter_version
+          ' versions.json | head -1)
+
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::Could not determine a Flutter version from versions.json"
+            exit 1
+          fi
+
+          echo "Building Flutter $version"
+          echo "flutter_version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: sdk
+          file: sdk/Dockerfile
+          target: flutter
+          platforms: linux/amd64,linux/arm64
+          push: false
+          provenance: false
+          build-args: |
+            flutter_version=${{ steps.version.outputs.flutter_version }}
+          # Read the release build's cache so the Android layers start
+          # warm, but never write to it -- a PR must not be able to
+          # influence what the release build reuses.
+          cache-from: type=gha,scope=flutter
