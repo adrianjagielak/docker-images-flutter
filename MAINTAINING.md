@@ -78,7 +78,9 @@ Inside the image it checks the tool versions, asserts `flutter doctor` does not 
 
 The APK build is the part that earns its keep. It is the only step that exercises the Android SDK, build-tools, accepted licenses, Gradle and the JDK *together* — which is most of what `sdk/Dockerfile` can get wrong, and none of which is caught by the image merely building. Expect it to dominate the runtime, since Gradle downloads its distribution and the Android dependencies on each run.
 
-The `flutter doctor` assertion fails only on an explicit `[✗]` or `[!]` against the Android toolchain rather than matching the success glyph, so a cosmetic change to Flutter's output cannot turn a release red on its own; the APK build is the real check behind it.
+The `flutter doctor` assertion fails only on an explicit `[✗]` or `[!]` against the Android toolchain rather than matching the success glyph, so a cosmetic change to Flutter's output cannot turn a release red on its own; the APK build is the real check behind it. (Worth knowing: `flutter doctor` reports the Android toolchain as `[✓]` on arm64 even though `adb` there cannot execute, which is precisely why the assertion is not the whole test.)
+
+The APK build runs only where `aapt2` is executable, which today means `linux/amd64` — see the Android SDK layers section above for why. On `linux/arm64` the run stops after `flutter test` and says so; everything before that point is exercised on both architectures.
 
 ## Local development
 
@@ -119,6 +121,8 @@ Pin a Flutter version manually by editing `versions.json` and pushing to `master
 The image used to be built `FROM ghcr.io/cirruslabs/android-sdk:36`, from the same wound-down Cirrus Labs project as the upstream Flutter image — so it would never have received another Android SDK bump, and would have broken outright (`manifest unknown`) if the package were ever deleted.
 
 Those instructions are now inlined into the `android-sdk` stage of [`sdk/Dockerfile`](./sdk/Dockerfile), copied from `cirruslabs/docker-images-android` (`sdk/tools` + `sdk/36`) as of its final state. The image builds `FROM ubuntu:24.04` and there is no Cirrus Labs dependency left anywhere in the chain. The one behavioural difference from the old base image is the container-global git identity, which used to be `Cirrus CI <support@cirruslabs.org>` and is now `CI <ci@localhost>`.
+
+One inherited limitation is worth knowing about, because it looks like a bug the first time CI shows it: on `linux/arm64` the `adb` and `aapt2` binaries in the image are x86-64 and do not run, so that architecture cannot assemble an APK. Google publishes the Android `platform-tools` and `build-tools` for `linux-x86_64` only and `sdkmanager` installs those regardless of host architecture — `ghcr.io/cirruslabs/android-sdk:36` has exactly the same x86-64 binaries in its arm64 image, so this predates the inlining and is not something the move introduced. The smoke test skips the APK build where `aapt2` will not run, and picks it up automatically if Google ever ships linux-arm64 build-tools.
 
 Three pins in that stage are ours to move now, and nothing bumps them automatically:
 

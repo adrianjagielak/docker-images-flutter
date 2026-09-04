@@ -49,6 +49,8 @@ The image is built from `ubuntu:24.04` and contains, in one layer stack:
 
 `ANDROID_HOME`/`ANDROID_SDK_ROOT` point at `/opt/android-sdk-linux` and `FLUTTER_HOME`/`FLUTTER_ROOT` at `/sdks/flutter`. Both SDKs, and the Dart SDK at `${FLUTTER_HOME}/bin/cache/dart-sdk/bin`, are on `PATH`.
 
+> **`linux/arm64` cannot build Android APKs.** Google publishes the Android `platform-tools` and `build-tools` for `linux-x86_64` only, and `sdkmanager` installs those whatever the host architecture is — so on `linux/arm64` the `adb` and `aapt2` binaries in the image are x86-64 and do not run. Dart and Flutter themselves are native and fully working there: `flutter test`, `flutter analyze`, `flutter pub` and web builds are all fine. Use `linux/amd64` for anything that assembles an Android artifact. This is inherited from the Android SDK image this one was previously based on, which has the same limitation.
+
 The Android half used to come from `ghcr.io/cirruslabs/android-sdk:36`. Those instructions now live in [`sdk/Dockerfile`](./sdk/Dockerfile) alongside the Flutter ones, so this repository builds the whole stack itself and depends on no Cirrus Labs image.
 
 ## Package
