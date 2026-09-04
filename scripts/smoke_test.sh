@@ -70,14 +70,15 @@ docker run "${run_args[@]}" "$IMAGE" bash -euo pipefail -c '
 
     # Google publishes the Android platform-tools and build-tools for
     # linux-x86_64 only, and sdkmanager installs those whatever the host
-    # architecture is, so on arm64 the adb and aapt2 in this image are
-    # x86-64 binaries that cannot run. That is inherited from the Android
-    # SDK this image is built from, not specific to this build, and it
-    # means an APK cannot be assembled there.
+    # architecture is, so on a non-x86_64 host the adb and aapt2 in this
+    # image are x86-64 binaries that cannot run and no APK can be built.
+    # That is why only linux/amd64 images are published -- see README.
     #
-    # Gate on whether aapt2 actually runs rather than on uname, so this
-    # starts exercising the APK build by itself if Google ever ships
-    # linux-arm64 build-tools.
+    # CI therefore always takes the first branch. The check is here for
+    # anyone running this script by hand against an image they built on
+    # an arm64 machine, where it explains the failure instead of letting
+    # Gradle report it as a mystery, and it would start exercising the
+    # APK build by itself if Google ever shipped linux-arm64 build-tools.
     aapt2="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/aapt2"
     if "$aapt2" version >/dev/null 2>&1; then
         echo "--- flutter build apk --debug ---"
@@ -90,9 +91,10 @@ docker run "${run_args[@]}" "$IMAGE" bash -euo pipefail -c '
         echo "--- flutter build apk --debug: SKIPPED ---"
         echo "$aapt2 does not run on $(uname -m):"
         echo "  $("$aapt2" version 2>&1 | head -1)"
-        echo "The Android build tools are published for linux-x86_64 only, so this"
-        echo "image cannot assemble an APK on this architecture. Everything above"
-        echo "-- the Dart and Flutter halves -- was exercised in full."
+        echo "The Android build tools are published for linux-x86_64 only, so an"
+        echo "image on this architecture cannot assemble an APK; this is why only"
+        echo "linux/amd64 is published. Everything above -- the Dart and Flutter"
+        echo "halves -- was exercised in full."
     fi
 
     echo "SMOKE TEST PASSED"

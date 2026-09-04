@@ -5,11 +5,11 @@ name: PR build check
 # structural change to sdk/Dockerfile would first be exercised after it
 # had already been merged.
 #
-# Builds the current stable Flutter entry for each published
-# architecture on a native runner, then runs the end-to-end smoke test
-# against it. Nothing is pushed and no registry credentials are needed.
-# Version bumps to versions.json do not trigger it; only changes that
-# can actually break the image do.
+# Builds the current stable Flutter entry and runs the end-to-end smoke
+# test against it -- the same script the release workflow uses. Nothing
+# is pushed and no registry credentials are needed. Version bumps to
+# versions.json do not trigger it; only changes that can actually break
+# the image do.
 
 on:
   pull_request:
@@ -18,7 +18,6 @@ on:
       - "scripts/smoke_test.sh"
       - ".github/workflows/pr-build.yml"
       - ".github/workflows/build-and-push.yml"
-      - ".github/workflows/release-image.yml"
   workflow_dispatch:
 
 permissions:
@@ -31,16 +30,7 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -84,9 +74,8 @@ jobs:
           context: sdk
           file: sdk/Dockerfile
           target: flutter
-          # Each runner is native for its own architecture, so no QEMU
-          # and the result can be loaded into the daemon to be tested.
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
+          # Loaded into the daemon so the smoke test can run against it.
           load: true
           push: false
           provenance: false

@@ -64,7 +64,9 @@ RUN set -o xtrace \
 COPY android-wait-for-emulator /usr/bin/android-wait-for-emulator
 RUN chmod +x /usr/bin/android-wait-for-emulator
 
-# emulator is not available on linux/arm64 (https://issuetracker.google.com/issues/227219818)
+# Only linux/amd64 is published, so this always installs in CI. The guard
+# is for local builds on an arm64 machine, where the emulator package does
+# not exist (https://issuetracker.google.com/issues/227219818).
 RUN if [ $(uname -m) = "x86_64" ]; then sdkmanager emulator ; fi
 
 # https://developer.android.com/studio/releases/platforms

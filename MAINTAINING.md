@@ -17,7 +17,7 @@ If you forked from `adrianjagielak/docker-images-flutter`, also update the image
 
 ## How the automation works
 
-Two workflows keep this repository running without manual intervention, a third does the actual releasing, and a fourth gates changes to the image before they merge.
+Two workflows keep this repository running without manual intervention, and a third gates changes to the image before they merge.
 
 ### `.github/workflows/check-flutter-versions.yml`
 
@@ -34,53 +34,48 @@ Because pushes made by `GITHUB_TOKEN` do not trigger downstream workflows, the b
 
 Triggered by:
 
-- pushes to the default branch that touch `versions.json`, `sdk/**`, or either build workflow
+- pushes to the default branch that touch `versions.json`, `sdk/**`, the smoke-test script, or the workflow itself
 - the version checker after it commits a bump
 - a weekly cron (`Monday 05:00 UTC`) so base-image security updates land even when Flutter does not move
 - manual `workflow_dispatch`, with an optional `flutter_version` filter to rebuild just one entry
 
-It does no building itself. It turns `versions.json` into a matrix — one entry per unique Flutter version, carrying that version's normalized image tag and every channel tag pointing at it — and calls `release-image.yml` once per entry.
+`prepare` turns `versions.json` into a matrix — one entry per unique Flutter version, carrying that version's normalized image tag and every channel tag pointing at it. `build` then runs once per entry, and each entry does the whole release itself:
 
-Calling a reusable workflow per version rather than running one matrixed build job is deliberate: it keeps each version's release independent. A beta that fails to build, or fails its smoke test, cannot hold back a good stable, and vice versa.
+1. **Build** into the runner's Docker daemon (`load: true`, `push: false`) rather than straight to the registry.
+2. **Smoke test** that loaded image with [`scripts/smoke_test.sh`](./scripts/smoke_test.sh).
+3. **Push** — reached only if the test passed — tagging the image with its exact Flutter version and then every channel tag.
 
-### `.github/workflows/release-image.yml`
+Building into the daemon first is what makes the ordering possible: **nothing reaches GHCR until a real Flutter app has been built inside the image.** A version that fails to build or fails its test publishes nothing at all, and every tag it would have moved keeps pointing at the last image that passed. That is the same failure behaviour the workflow always had — a failed build has always meant tags stay put — except that "failed" now also covers an image that builds but cannot compile an app. Watch for a red run; nothing else will tell you a channel has stopped moving.
 
-The release pipeline for a single Flutter version, in three stages:
-
-1. **build** — builds the multi-arch (amd64 + arm64) image and pushes it under its exact Flutter version tag *only*. `arm64` goes through QEMU emulation on the same `ubuntu-latest` runner as `amd64`.
-2. **smoke-test** — runs [`scripts/smoke_test.sh`](./scripts/smoke_test.sh) against that pushed tag, once per architecture on a runner native to it (`ubuntu-latest` and `ubuntu-24.04-arm`), so the Flutter app build inside the image is not emulated.
-3. **promote** — only if both smoke tests pass, moves the channel tags (`latest`, `stable`, `beta`, ...) onto the tested image with `docker buildx imagetools create`. That is a registry-side manifest write: no rebuild, no layer upload.
-
-The consequence worth knowing: **a channel tag never points at an image that failed its smoke test.** When the smoke test fails, the version tag stays published so you can pull it and debug, and the channel tags keep pointing at the last image that passed — so a bad build makes channels go stale rather than broken. Watch for a red run; nothing else will tell you a channel has stopped moving.
+`fail-fast: false` keeps the versions independent: a broken beta publishes nothing but does not stop a good stable from going out.
 
 All matrix entries share one `type=gha` cache scope. Since the image builds the Android SDK itself rather than inheriting it from a prebuilt base, the Android layers are byte-identical across Flutter versions, and a shared scope lets a build of a brand-new Flutter version start from them instead of rebuilding the Android half from scratch. The Flutter-specific layers are a cache miss for a new version either way, so nothing is lost by not scoping per version — and one scope rather than N keeps the repository under the 10 GB GitHub Actions cache limit.
 
-Emulated arm64 now covers the Android SDK install (`apt`, and several JVM `sdkmanager` runs) as well as the Flutter steps, so a cold cache is considerably slower than it used to be. If `arm64` build time becomes painful, the build job can be split across `ubuntu-latest` + `ubuntu-24.04-arm` so each architecture builds natively — as the smoke test and PR check already do — with a `docker buildx imagetools create` step to merge the two into one manifest.
+Only `linux/amd64` is built, so there is no QEMU anywhere in the pipeline and the image can be loaded into the daemon at all — a multi-arch build cannot be. See the Android SDK layers section for why arm64 is not published.
 
 ### `.github/workflows/pr-build.yml`
 
 Pre-merge validation. The release workflow only runs on pushes to the default branch, so without this a structural change to the image would first be exercised *after* it had been merged.
 
-On a pull request touching `sdk/**`, the smoke-test script, or any build workflow, it builds the current `stable` entry from `versions.json` and runs the smoke test against it — once per architecture, each on a runner native to it, with `push: false`. No registry credentials, no tags, result discarded. Version bumps to `versions.json` deliberately do not trigger it: those change nothing that can break the image, and they land on `master` directly rather than through a PR anyway.
+On a pull request touching `sdk/**`, the smoke-test script, or either build workflow, it builds the current `stable` entry from `versions.json` and runs the same smoke test against it, with `push: false`. No registry credentials, no tags, result discarded. Version bumps to `versions.json` deliberately do not trigger it: those change nothing that can break the image, and they land on `master` directly rather than through a PR anyway.
 
-It reads the release build's `type=gha` cache scope so the Android layers start warm, but never writes to it — a pull request must not be able to influence what the release build reuses. Runs are capped at 120 minutes per architecture and superseded by the next push to the same PR.
+It reads the release build's `type=gha` cache scope so the Android layers start warm, but never writes to it — a pull request must not be able to influence what the release build reuses. That means a PR build is cold apart from the Android prefix, which is a few minutes; adding a PR-scoped `cache-to` would speed up repeat pushes but count against the same 10 GB budget and risk evicting the release cache, which is the more valuable one.
 
 ## The smoke test
 
-[`scripts/smoke_test.sh`](./scripts/smoke_test.sh) takes an image reference and an optional platform, and is what both the PR check and the release pipeline use:
+[`scripts/smoke_test.sh`](./scripts/smoke_test.sh) takes an image reference and an optional platform, and is what both the PR check and the release build use:
 
 ```bash
 bash scripts/smoke_test.sh ghcr.io/adrianjagielak/flutter:stable
-bash scripts/smoke_test.sh ghcr.io/adrianjagielak/flutter:stable linux/arm64
 ```
 
 Inside the image it checks the tool versions, asserts `flutter doctor` does not report a problem with the Android toolchain, then creates a throwaway Flutter app and runs `flutter analyze`, `flutter test` and `flutter build apk --debug` against it.
 
-The APK build is the part that earns its keep. It is the only step that exercises the Android SDK, build-tools, accepted licenses, Gradle and the JDK *together* — which is most of what `sdk/Dockerfile` can get wrong, and none of which is caught by the image merely building. Expect it to dominate the runtime, since Gradle downloads its distribution and the Android dependencies on each run.
+The APK build is the part that earns its keep. It is the only step that exercises the Android SDK, build-tools, accepted licenses, Gradle and the JDK *together* — which is most of what `sdk/Dockerfile` can get wrong, and none of which is caught by the image merely building. Expect it to dominate the runtime, since Gradle downloads its distribution and the Android dependencies on each run. It is also the step most exposed to upstream rate limits, since it pulls from `plugins.gradle.org` and Maven Central; Flutter retries once internally, and a run that fails there with HTTP 429 is worth re-running before treating it as a real failure.
 
-The `flutter doctor` assertion fails only on an explicit `[✗]` or `[!]` against the Android toolchain rather than matching the success glyph, so a cosmetic change to Flutter's output cannot turn a release red on its own; the APK build is the real check behind it. (Worth knowing: `flutter doctor` reports the Android toolchain as `[✓]` on arm64 even though `adb` there cannot execute, which is precisely why the assertion is not the whole test.)
+The `flutter doctor` assertion fails only on an explicit `[✗]` or `[!]` against the Android toolchain rather than matching the success glyph, so a cosmetic change to Flutter's output cannot turn a release red on its own; the APK build is the real check behind it. That split matters more than it looks: `flutter doctor` reported the Android toolchain as `[✓]` on arm64 even when `adb` there could not execute at all, and only the APK build caught it.
 
-The APK build runs only where `aapt2` is executable, which today means `linux/amd64` — see the Android SDK layers section above for why. On `linux/arm64` the run stops after `flutter test` and says so; everything before that point is exercised on both architectures.
+The script skips the APK build where `aapt2` will not run. CI never takes that branch now that only `linux/amd64` is published; it is there for anyone running the script by hand against an image built on an arm64 machine, where it explains the problem instead of leaving Gradle to report it as a mystery.
 
 ## Local development
 
@@ -88,7 +83,7 @@ Build a single version locally:
 
 ```bash
 docker buildx build \
-    --platform linux/amd64,linux/arm64 \
+    --platform linux/amd64 \
     --build-arg flutter_version=3.41.9 \
     --tag ghcr.io/adrianjagielak/flutter:3.41.9 \
     sdk
@@ -122,7 +117,13 @@ The image used to be built `FROM ghcr.io/cirruslabs/android-sdk:36`, from the sa
 
 Those instructions are now inlined into the `android-sdk` stage of [`sdk/Dockerfile`](./sdk/Dockerfile), copied from `cirruslabs/docker-images-android` (`sdk/tools` + `sdk/36`) as of its final state. The image builds `FROM ubuntu:24.04` and there is no Cirrus Labs dependency left anywhere in the chain. The one behavioural difference from the old base image is the container-global git identity, which used to be `Cirrus CI <support@cirruslabs.org>` and is now `CI <ci@localhost>`.
 
-One inherited limitation is worth knowing about, because it looks like a bug the first time CI shows it: on `linux/arm64` the `adb` and `aapt2` binaries in the image are x86-64 and do not run, so that architecture cannot assemble an APK. Google publishes the Android `platform-tools` and `build-tools` for `linux-x86_64` only and `sdkmanager` installs those regardless of host architecture — `ghcr.io/cirruslabs/android-sdk:36` has exactly the same x86-64 binaries in its arm64 image, so this predates the inlining and is not something the move introduced. The smoke test skips the APK build where `aapt2` will not run, and picks it up automatically if Google ever ships linux-arm64 build-tools.
+### Why `linux/arm64` is not published
+
+This repository used to publish an arm64 image, and it was broken in a way nothing tested for: `adb` and `aapt2` in it were x86-64 binaries, so they could not execute and no APK could be assembled. Google publishes the Android `platform-tools` and `build-tools` for `linux-x86_64` only, and `sdkmanager` installs those regardless of host architecture. `ghcr.io/cirruslabs/android-sdk:36` has exactly the same x86-64 binaries in its arm64 image, so this long predates the inlining — it was simply invisible until the smoke test tried to build an app.
+
+Rather than keep shipping an image that cannot do the thing it exists for, arm64 was dropped. It was a real if narrow loss: the arm64 image did work for `flutter test`, `flutter analyze`, `flutter pub` and web builds, and anyone using it that way now needs `--platform linux/amd64` and emulation.
+
+Publishing it again is a small change — `platforms:` in `build-and-push.yml` plus the `load: true`/push flow, which only works because the build is single-arch — but only worth doing if Google ships `linux-arm64` build-tools. The smoke test would pick that up on its own: it gates the APK build on whether `aapt2` actually runs, not on `uname`.
 
 Three pins in that stage are ours to move now, and nothing bumps them automatically:
 
@@ -151,14 +152,14 @@ The Android SDK image downloaded this helper from `travis-ci/travis-cookbooks@ma
 
 ### Third-party GitHub Actions
 
-`release-image.yml` and `pr-build.yml` use `jlumbroso/free-disk-space@main` (unpinned). If you prefer supply-chain pinning, replace `@main` with a commit SHA. The other actions (`docker/setup-qemu-action`, `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action`, `actions/checkout`) are pinned to major versions.
+`build-and-push.yml` and `pr-build.yml` use `jlumbroso/free-disk-space@main` (unpinned). If you prefer supply-chain pinning, replace `@main` with a commit SHA. The other actions (`docker/setup-qemu-action`, `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action`, `actions/checkout`) are pinned to major versions.
 
 ## Maintenance checklist
 
 Expect occasional human attention when:
 
 - **A Flutter release breaks the build.** Inspect the failing job in **Build and push Docker images**. Fix `sdk/Dockerfile` (e.g. Flutter adds a new precache requirement, changes its repository layout, or drops support for the current Dart/Android baseline) and push.
-- **The smoke test fails.** The channel tags for that version were not moved, so users are still on the last good image while you look. Reproduce with `bash scripts/smoke_test.sh <image>` against the published version tag, which stays up precisely for this. If Flutter changes the generated app template or its tooling output, the fix may belong in `scripts/smoke_test.sh` rather than in the image.
+- **The smoke test fails.** Nothing was published for that version, so users are still on the last good image while you look. Reproduce by building locally and running `bash scripts/smoke_test.sh <image>`. If Flutter changes the generated app template or its tooling output, the fix may belong in `scripts/smoke_test.sh` rather than in the image.
 - **The Android SDK pins need moving.** Bump `ANDROID_PLATFORM_VERSION` / `ANDROID_BUILD_TOOLS_VERSION` / `ANDROID_SDK_TOOLS_VERSION` in `sdk/Dockerfile` as described above. Nothing polls for these, so it takes a human noticing.
 - **Flutter changes its release feed.** Update `scripts/update_flutter_versions.sh`.
 - **A new channel needs tracking** (e.g. you want to publish `dev` or `master` builds). Add it to the matrix produced in `scripts/update_flutter_versions.sh` and to the `images` array in `versions.json`.

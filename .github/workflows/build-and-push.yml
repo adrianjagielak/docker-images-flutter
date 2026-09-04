@@ -1,15 +1,18 @@
 name: Build and push Docker images
 
-# Reads the Flutter versions declared in versions.json and releases each
-# one through .github/workflows/release-image.yml, which builds the
-# multi-arch image, smoke-tests it on a native runner per architecture,
-# and only then moves the channel tags (latest, stable, beta, ...) onto
-# it.
+# Reads the Flutter versions declared in versions.json and, for each
+# version, builds the image, smoke-tests it, and pushes it only if the
+# test passes -- under its exact Flutter version tag and every channel
+# tag (latest, stable, beta, ...) that points at it.
 #
-# Each version is released by its own call of that workflow, so a
-# version that fails to build or fails its smoke test does not hold back
-# the others. Runs whenever the inputs change, on a weekly cadence to
-# pick up base-image security updates, and on demand.
+# The image is built into the runner's Docker daemon rather than pushed
+# straight to the registry, so scripts/smoke_test.sh gets to run a real
+# Flutter app build against it before anything reaches GHCR. A version
+# that fails to build or fails its test publishes nothing at all, and
+# the channel tags keep pointing at the last image that passed.
+#
+# Runs whenever the inputs change, on a weekly cadence to pick up
+# base-image security updates, and on demand.
 
 on:
   push:
@@ -18,7 +21,7 @@ on:
       - "versions.json"
       - "sdk/**"
       - ".github/workflows/build-and-push.yml"
-      - ".github/workflows/release-image.yml"
+      - "scripts/smoke_test.sh"
   workflow_dispatch:
     inputs:
       flutter_version:
@@ -93,16 +96,86 @@ jobs:
             fi
           } >>"$GITHUB_OUTPUT"
 
-  release:
+  build:
     needs: prepare
     if: needs.prepare.outputs.empty == 'false'
+    name: ${{ matrix.version_tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
+      # Each version stands alone: one that fails to build or fails its
+      # smoke test must not stop the others from being published.
       fail-fast: false
       max-parallel: 2
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
-    uses: ./.github/workflows/release-image.yml
-    with:
-      flutter_version: ${{ matrix.flutter_version }}
-      version_tag: ${{ matrix.version_tag }}
-      channel_tags: ${{ toJson(matrix.tags) }}
-    secrets: inherit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free up disk space
+        # Flutter images are large, and this job holds both the build
+        # cache and the loaded image at once. The image builds its own
+        # Android SDK, so the runner's preinstalled copy is dead weight
+        # and gets reclaimed too.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: sdk
+          file: sdk/Dockerfile
+          target: flutter
+          platforms: linux/amd64
+          # Load into the daemon instead of pushing, so the smoke test
+          # can run against the real image before it is published.
+          load: true
+          push: false
+          provenance: false
+          build-args: |
+            flutter_version=${{ matrix.flutter_version }}
+          tags: flutter-image:under-test
+          # One shared cache scope rather than one per Flutter version.
+          # The image builds the Android SDK itself instead of inheriting
+          # it from a prebuilt base, and those layers are identical for
+          # every Flutter version -- a per-version scope would rebuild
+          # the whole Android half every time a channel moves. A shared
+          # scope keeps that prefix warm; the Flutter-specific layers
+          # miss for a new version either way.
+          cache-from: type=gha,scope=flutter
+          cache-to: type=gha,mode=max,scope=flutter
+
+      - name: Smoke test
+        run: bash scripts/smoke_test.sh flutter-image:under-test
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        env:
+          CHANNEL_TAGS: ${{ toJson(matrix.tags) }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION_TAG: ${{ matrix.version_tag }}
+        run: |
+          # Only reached when the smoke test passed. The version tag goes
+          # first so that if a later push fails, the channel tags are
+          # still pointing at an image that exists and works.
+          for t in "$VERSION_TAG" $(jq -r '.[]' <<<"$CHANNEL_TAGS"); do
+            echo "Pushing ${IMAGE}:${t}"
+            docker tag flutter-image:under-test "${IMAGE}:${t}"
+            docker push "${IMAGE}:${t}"
+          done
