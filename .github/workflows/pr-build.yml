@@ -5,17 +5,20 @@ name: PR build check
 # structural change to sdk/Dockerfile would first be exercised after it
 # had already been merged.
 #
-# Builds the current stable Flutter entry for both published
-# architectures and throws the result away -- nothing is pushed and no
-# registry credentials are needed. Version bumps to versions.json do not
-# trigger it; only changes that can actually break the build do.
+# Builds the current stable Flutter entry for each published
+# architecture on a native runner, then runs the end-to-end smoke test
+# against it. Nothing is pushed and no registry credentials are needed.
+# Version bumps to versions.json do not trigger it; only changes that
+# can actually break the image do.
 
 on:
   pull_request:
     paths:
       - "sdk/**"
+      - "scripts/smoke_test.sh"
       - ".github/workflows/pr-build.yml"
       - ".github/workflows/build-and-push.yml"
+      - ".github/workflows/release-image.yml"
   workflow_dispatch:
 
 permissions:
@@ -28,10 +31,17 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    # arm64 goes through QEMU, so a cold cache is slow. Bound it well
-    # short of the 6h default so a runaway build fails loudly instead.
-    timeout-minutes: 240
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -40,7 +50,7 @@ jobs:
         id: version
         run: |
           # Build whatever versions.json currently calls stable; one
-          # version is enough to prove the Dockerfile works.
+          # version is enough to prove the image works.
           version=$(jq -r '
             (.images[] | select(.tags | index("stable")) | .flutter_version)
             // .images[0].flutter_version
@@ -65,11 +75,6 @@ jobs:
           docker-images: false
           swap-storage: true
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -79,12 +84,19 @@ jobs:
           context: sdk
           file: sdk/Dockerfile
           target: flutter
-          platforms: linux/amd64,linux/arm64
+          # Each runner is native for its own architecture, so no QEMU
+          # and the result can be loaded into the daemon to be tested.
+          platforms: ${{ matrix.platform }}
+          load: true
           push: false
           provenance: false
           build-args: |
             flutter_version=${{ steps.version.outputs.flutter_version }}
+          tags: flutter-pr-build:under-test
           # Read the release build's cache so the Android layers start
-          # warm, but never write to it -- a PR must not be able to
-          # influence what the release build reuses.
+          # warm, but never write to it -- a pull request must not be
+          # able to influence what the release build reuses.
           cache-from: type=gha,scope=flutter
+
+      - name: Smoke test
+        run: bash scripts/smoke_test.sh flutter-pr-build:under-test

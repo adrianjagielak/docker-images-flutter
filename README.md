@@ -25,7 +25,7 @@ docker pull ghcr.io/adrianjagielak/flutter:3.41.9
 
 ## Available tags
 
-Channel tags float to the latest release on that channel and are refreshed automatically:
+Channel tags float to the latest release on that channel and are refreshed automatically. A channel tag is only moved onto an image after that image has passed an end-to-end smoke test — creating a Flutter app and building a debug APK — on both architectures, so a channel never points at an image that cannot build an app:
 
 | Tag      | Tracks                              |
 | -------- | ----------------------------------- |

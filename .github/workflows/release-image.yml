@@ -1,0 +1,168 @@
+name: Release image
+
+# Build, test and publish a single Flutter version.
+#
+# Called once per entry in versions.json by build-and-push.yml, which is
+# what keeps each version's release independent: a beta that fails to
+# build or fails its smoke test cannot hold back a good stable, and vice
+# versa.
+#
+# The image goes out under its exact Flutter version first. The channel
+# tags (latest, stable, beta, ...) are only moved onto it once the
+# end-to-end smoke test passes on both architectures, so a channel tag
+# never points at an image that could not build a Flutter app. If the
+# smoke test fails the version tag stays published for debugging and the
+# channel tags keep pointing at the last image that passed.
+
+on:
+  workflow_call:
+    inputs:
+      flutter_version:
+        description: "Flutter version to build, as it appears in versions.json."
+        required: true
+        type: string
+      version_tag:
+        description: "Image tag for that exact version ('+' normalized to '-')."
+        required: true
+        type: string
+      channel_tags:
+        description: "JSON array of channel tags to move onto the image once it passes."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/flutter
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Free up disk space
+        # Flutter images are large; the default runner does not have
+        # enough headroom for a multi-arch buildx run with caching. The
+        # image builds its own Android SDK, so the runner's preinstalled
+        # copy is dead weight and gets reclaimed too.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: sdk
+          file: sdk/Dockerfile
+          target: flutter
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            flutter_version=${{ inputs.flutter_version }}
+          # Only the exact-version tag at this point; channel tags are
+          # moved on by the promote job once the smoke test passes.
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version_tag }}
+          # One shared cache scope rather than one per Flutter version.
+          # The image builds the Android SDK itself instead of inheriting
+          # it from a prebuilt base, and those layers are identical for
+          # every Flutter version -- a per-version scope would rebuild
+          # the whole Android half (under QEMU, for arm64) every time a
+          # channel moves. A shared scope keeps that prefix warm; the
+          # Flutter-specific layers miss for a new version either way.
+          cache-from: type=gha,scope=flutter
+          cache-to: type=gha,mode=max,scope=flutter
+
+  smoke-test:
+    needs: build
+    name: smoke-test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Smoke test
+        # Each runner is native for its architecture, so the Flutter app
+        # build inside the image is not emulated.
+        run: |
+          bash scripts/smoke_test.sh \
+            "${REGISTRY}/${IMAGE_NAME}:${{ inputs.version_tag }}" \
+            "${{ matrix.platform }}"
+
+  promote:
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point channel tags at the tested image
+        env:
+          CHANNEL_TAGS: ${{ inputs.channel_tags }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION_TAG: ${{ inputs.version_tag }}
+        run: |
+          # Copies the already-pushed multi-arch manifest onto each
+          # channel tag. No rebuild and no layer upload -- this is a
+          # registry-side manifest write.
+          args=()
+          while read -r t; do
+            [ -n "$t" ] && args+=(--tag "${IMAGE}:${t}")
+          done < <(jq -r '.[]' <<<"$CHANNEL_TAGS")
+
+          if [ ${#args[@]} -eq 0 ]; then
+            echo "No channel tags for ${VERSION_TAG}; nothing to promote."
+            exit 0
+          fi
+
+          echo "Promoting ${IMAGE}:${VERSION_TAG} -> ${args[*]}"
+          docker buildx imagetools create "${args[@]}" "${IMAGE}:${VERSION_TAG}"
