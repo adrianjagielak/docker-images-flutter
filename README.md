@@ -25,7 +25,7 @@ docker pull ghcr.io/adrianjagielak/flutter:3.41.9
 
 ## Available tags
 
-Channel tags float to the latest release on that channel and are refreshed automatically:
+Channel tags float to the latest release on that channel and are refreshed automatically. An image is published only after it passes an end-to-end smoke test — creating a Flutter app and building a debug APK inside it — so a tag never points at an image that cannot build an app:
 
 | Tag      | Tracks                              |
 | -------- | ----------------------------------- |
@@ -35,13 +35,21 @@ Channel tags float to the latest release on that channel and are refreshed autom
 
 In addition, every build is tagged with its exact Flutter version (e.g. `3.41.9`, `3.44.0-0.3.pre`). `+` characters in pre-release versions are normalized to `-` so the tag is valid in OCI references.
 
-Images are built for `linux/amd64` and `linux/arm64`.
+Images are built for `linux/amd64` only. `linux/arm64` is no longer published: Google ships the Android `platform-tools` and `build-tools` for `linux-x86_64` only, so `adb` and `aapt2` in an arm64 image are x86-64 binaries that cannot run and no Android artifact can be built there. Earlier arm64 images — here and in `cirruslabs/flutter` before it — had that limitation silently; they could run `flutter test` and `flutter analyze` but never `flutter build apk`. On an arm64 host, run the `amd64` image under emulation (`docker run --platform linux/amd64 ...`).
 
 For the full set of published image tags, see the package page on [GHCR](https://github.com/adrianjagielak/docker-images-flutter/pkgs/container/flutter).
 
 ## What's in the image
 
-Each image is layered on the Android SDK image, clones the requested Flutter ref, accepts the Android SDK licenses, and runs `flutter precache --android`. The Dart SDK is on `PATH` via `${FLUTTER_HOME}/bin/cache/dart-sdk/bin`.
+The image is built from `ubuntu:24.04` and contains, in one layer stack:
+
+- **JDK 21**, plus the build tooling the Android SDK expects (`git`, `curl`, `wget`, `unzip`, `ruby`, `build-essential`, `sqlite3`, and the shared libraries the x86 emulator needs).
+- **Android SDK** — command-line tools, `platform-tools`, `platforms;android-36`, `build-tools;36.0.0`, all licenses accepted. The emulator is included.
+- **Flutter SDK** at the requested version, cloned to `/sdks/flutter`, with `flutter precache --android` already run.
+
+`ANDROID_HOME`/`ANDROID_SDK_ROOT` point at `/opt/android-sdk-linux` and `FLUTTER_HOME`/`FLUTTER_ROOT` at `/sdks/flutter`. Both SDKs, and the Dart SDK at `${FLUTTER_HOME}/bin/cache/dart-sdk/bin`, are on `PATH`.
+
+The Android half used to come from `ghcr.io/cirruslabs/android-sdk:36`. Those instructions now live in [`sdk/Dockerfile`](./sdk/Dockerfile) alongside the Flutter ones, so this repository builds the whole stack itself and depends on no Cirrus Labs image.
 
 ## Package
 
